@@ -138,9 +138,21 @@ export default function App() {
 
   function connectGC() {
     if (!GOOGLE_CLIENT_ID) { alert("Set VITE_GOOGLE_CLIENT_ID in Vercel Environment Variables first."); return; }
-    if (!tcRef.current)    { alert("Google API still loading — wait a moment and try again."); return; }
     setGcLoading(true);
-    tcRef.current.requestAccessToken({ prompt: "consent" });
+    // If Google isn't ready yet, keep retrying every 500ms for up to 10 seconds
+    let attempts = 0;
+    const tryConnect = () => {
+      attempts++;
+      if (tcRef.current) {
+        tcRef.current.requestAccessToken({ prompt: "consent" });
+      } else if (attempts < 20) {
+        setTimeout(tryConnect, 500);
+      } else {
+        setGcLoading(false);
+        alert("Google API failed to load. Please refresh the page and try again.");
+      }
+    };
+    tryConnect();
   }
 
   // Ask the AI
