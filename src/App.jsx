@@ -1,673 +1,482 @@
-import { useState, useEffect, useCallback } from "react";
-import {
-  initGoogle,
-  signIn,
-  signOut,
-  fetchWeekEvents,
-  createCalendarEvent,
-  updateCalendarEvent,
-  deleteCalendarEvent,
-} from "./googleCalendar";
+import { useState, useEffect, useRef } from "react";
 
-const ANTHROPIC_KEY = import.meta.env.VITE_ANTHROPIC_API_KEY;
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
+const ANTHROPIC_KEY = import.meta.env.VITE_ANTHROPIC_API_KEY || "";
 
-// --- Helpers ---
-function getWeekStart(date = new Date()) {
-  const d = new Date(date);
-  const day = d.getDay();
-  d.setDate(d.getDate() - day);
-  d.setHours(0, 0, 0, 0);
-  return d;
-}
+// Full calendar access (read + write)
+const SCOPES = "https://www.googleapis.com/auth/calendar";
 
-function formatDate(date) {
-  return date.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
-}
-
-function formatTime(dateStr) {
-  if (!dateStr) return "";
-  const d = new Date(dateStr);
-  if (isNaN(d)) return dateStr;
-  return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true });
-}
-
-function hourFromDate(dateStr) {
-  const d = new Date(dateStr);
-  return d.getHours() + d.getMinutes() / 60;
-}
-
-function durationHours(start, end) {
-  return (new Date(end) - new Date(start)) / 3600000;
-}
-
-const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const HOURS = Array.from({ length: 15 }, (_, i) => i + 7); // 7am–9pm
-
-const CATEGORY_COLORS = {
-  "deep-work": { bg: "rgba(245,158,11,0.18)", border: "#F59E0B", text: "#FCD34D", dot: "#F59E0B" },
-  meeting: { bg: "rgba(59,130,246,0.18)", border: "#3B82F6", text: "#93C5FD", dot: "#3B82F6" },
-  content: { bg: "rgba(20,184,166,0.18)", border: "#14B8A6", text: "#5EEAD4", dot: "#14B8A6" },
-  admin: { bg: "rgba(107,114,128,0.18)", border: "#6B7280", text: "#9CA3AF", dot: "#6B7280" },
-  other: { bg: "rgba(139,92,246,0.18)", border: "#8B5CF6", text: "#C4B5FD", dot: "#8B5CF6" },
+const C = {
+  bg:"#0a0a0f", surface:"#12121a", border:"#1e1e2e",
+  amber:"#f5a623", amberDim:"#f5a62318", blue:"#4a9eff", blueDim:"#4a9eff18",
+  teal:"#2dd4bf", tealDim:"#2dd4bf18", rose:"#fb7185", roseDim:"#fb718518",
+  muted:"#4a4a6a", text:"#e2e2f0", textDim:"#7a7a9a",
 };
 
-// Sample events for demo mode
-function getSampleEvents(weekStart) {
-  const d = (dayOffset, h, m) => {
-    const dt = new Date(weekStart);
-    dt.setDate(dt.getDate() + dayOffset);
-    dt.setHours(h, m, 0, 0);
-    return dt.toISOString();
-  };
-  return [
-    { id: "s1", title: "Deep Work: Product Strategy", start: d(1, 9, 0), end: d(1, 11, 0), category: "deep-work", color: "#F59E0B" },
-    { id: "s2", title: "Team Standup", start: d(1, 11, 0), end: d(1, 11, 30), category: "meeting", color: "#3B82F6" },
-    { id: "s3", title: "Client Call — Acme Corp", start: d(2, 14, 0), end: d(2, 15, 0), category: "meeting", color: "#3B82F6" },
-    { id: "s4", title: "Content Creation Block", start: d(3, 10, 0), end: d(3, 12, 0), category: "content", color: "#14B8A6" },
-    { id: "s5", title: "Deep Work: Feature Dev", start: d(4, 9, 0), end: d(4, 12, 0), category: "deep-work", color: "#F59E0B" },
-    { id: "s6", title: "Admin & Email", start: d(4, 16, 0), end: d(4, 17, 0), category: "admin", color: "#6B7280" },
-    { id: "s7", title: "Weekly Review", start: d(5, 15, 0), end: d(5, 16, 0), category: "admin", color: "#6B7280" },
-  ];
+const EC = {
+  "deep-work": { bg:C.amberDim, border:C.amber, label:C.amber, tag:"Deep Work" },
+  meeting:     { bg:C.blueDim,  border:C.blue,  label:C.blue,  tag:"Meeting"   },
+  content:     { bg:C.tealDim,  border:C.teal,  label:C.teal,  tag:"Content"   },
+  admin:       { bg:"#ffffff08",border:C.muted,  label:C.textDim,tag:"Admin"   },
+  personal:    { bg:C.roseDim,  border:C.rose,  label:C.rose,  tag:"Personal"  },
+};
+
+const HOURS = Array.from({ length:13 }, (_,i) => i + 7);
+const DAYS  = ["Mon","Tue","Wed","Thu","Fri"];
+
+const TASKS = [
+  { id:"t1", title:"Prepare pitch deck",           priority:"P1", source:"Notion", estimate:"3h" },
+  { id:"t2", title:"Record product demo video",    priority:"P1", source:"Linear", estimate:"2h" },
+  { id:"t3", title:"Write case study #3",          priority:"P2", source:"Notion", estimate:"2h" },
+  { id:"t4", title:"Respond to partnership emails",priority:"P2", source:"Linear", estimate:"1h" },
+  { id:"t5", title:"Update pricing page",          priority:"P3", source:"Notion", estimate:"1h" },
+];
+
+function getWeekDates() {
+  const now = new Date(), day = now.getDay();
+  const diff = now.getDate() - day + (day === 0 ? -6 : 1);
+  const mon = new Date(now);
+  mon.setDate(diff);
+  return Array.from({ length:5 }, (_,i) => {
+    const d = new Date(mon);
+    d.setDate(mon.getDate() + i);
+    return d;
+  });
 }
 
+function parseGCEvents(items, weekDates) {
+  return items
+    .filter(e => e.start?.dateTime)
+    .map((e, i) => {
+      const s  = new Date(e.start.dateTime);
+      const en = new Date(e.end?.dateTime || e.start.dateTime);
+      const di = weekDates.findIndex(d => d.toDateString() === s.toDateString());
+      if (di === -1) return null;
+      const sh = s.getHours()  + s.getMinutes()  / 60;
+      const eh = en.getHours() + en.getMinutes() / 60;
+      const t  = e.summary || "Untitled";
+      const l  = t.toLowerCase();
+      let type = "meeting";
+      if (l.includes("deep") || l.includes("focus"))                                  type = "deep-work";
+      else if (l.includes("content") || l.includes("write") || l.includes("record")) type = "content";
+      else if (l.includes("admin")   || l.includes("email") || l.includes("review")) type = "admin";
+      return { id:`gc-${e.id||i}`, gcId: e.id, title:t, day:di, startHour:sh, endHour:eh, type, source:"google" };
+    })
+    .filter(Boolean);
+}
+
+function calcGoals(evts) {
+  const s = t => evts.filter(e => e.type === t).reduce((a,e) => a + (e.endHour - e.startHour), 0);
+  return { deepWork: s("deep-work"), content: s("content"), meetings: s("meeting") };
+}
+
+function fmt(h) { return h % 1 === 0 ? `${h}:00` : `${Math.floor(h)}:30`; }
+
 export default function App() {
-  const [googleReady, setGoogleReady] = useState(false);
-  const [isSignedIn, setIsSignedIn] = useState(false);
-  const [events, setEvents] = useState([]);
-  const [weekStart, setWeekStart] = useState(getWeekStart());
-  const [selectedEvent, setSelectedEvent] = useState(null);
-  const [command, setCommand] = useState("");
-  const [aiLoading, setAiLoading] = useState(false);
-  const [suggestions, setSuggestions] = useState([]);
-  const [showEnergy, setShowEnergy] = useState(false);
-  const [goals, setGoals] = useState([
-    { id: 1, label: "Deep Work", target: 10, unit: "hrs", category: "deep-work" },
-    { id: 2, label: "Content", target: 4, unit: "hrs", category: "content" },
-    { id: 3, label: "Meetings", target: 6, unit: "hrs max", category: "meeting" },
-  ]);
-  const [demoMode, setDemoMode] = useState(false);
-  const [statusMsg, setStatusMsg] = useState("");
+  const [events,    setEvents]    = useState([]);
+  const [weekDates]               = useState(getWeekDates);
+  const [cmd,       setCmd]       = useState("");
+  const [loading,   setLoading]   = useState(false);
+  const [suggs,     setSuggs]     = useState([]);
+  const [gcOn,      setGcOn]      = useState(false);
+  const [gcLoading, setGcLoading] = useState(false);
+  const [toast,     setToast]     = useState("");
+  const tcRef = useRef(null);
+  const g = calcGoals(events);
 
-  // Init Google
-  useEffect(() => {
-    initGoogle(() => setGoogleReady(true));
-  }, []);
-
-  // Load events when signed in or week changes
-  const loadEvents = useCallback(async () => {
-    if (!isSignedIn) return;
-    try {
-      const evts = await fetchWeekEvents(weekStart);
-      setEvents(evts);
-    } catch (e) {
-      console.error(e);
-    }
-  }, [isSignedIn, weekStart]);
-
-  useEffect(() => {
-    if (isSignedIn) loadEvents();
-  }, [loadEvents]);
-
-  // Demo mode
-  useEffect(() => {
-    if (demoMode) setEvents(getSampleEvents(weekStart));
-  }, [demoMode, weekStart]);
-
-  const handleSignIn = () => {
-    signIn((ok) => {
-      if (ok) {
-        setIsSignedIn(true);
-        setDemoMode(false);
-      }
-    });
-  };
-
-  const handleSignOut = () => {
-    signOut();
-    setIsSignedIn(false);
-    setEvents([]);
-  };
-
-  // Compute goal progress
-  function getProgress(category) {
-    const relevant = events.filter((e) => e.category === category);
-    const totalHrs = relevant.reduce((sum, e) => {
-      if (!e.start || !e.end) return sum;
-      return sum + durationHours(e.start, e.end);
-    }, 0);
-    return Math.round(totalHrs * 10) / 10;
+  function showToast(msg) {
+    setToast(msg);
+    setTimeout(() => setToast(""), 4000);
   }
 
-  // AI Scheduling
-  async function runAI() {
-    if (!command.trim()) return;
-    setAiLoading(true);
-    setSuggestions([]);
+  // Google API init
+  useEffect(() => {
+    let n = 0;
+    const iv = setInterval(() => {
+      n++;
+      if (n > 50) { clearInterval(iv); return; }
+      if (!window.gapi || !window.google?.accounts) return;
+      clearInterval(iv);
+      window.gapi.load("client", async () => {
+        try {
+          await window.gapi.client.init({
+            discoveryDocs: ["https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest"],
+          });
+        } catch(_) {}
+        if (!GOOGLE_CLIENT_ID) return;
+        tcRef.current = window.google.accounts.oauth2.initTokenClient({
+          client_id: GOOGLE_CLIENT_ID,
+          scope: SCOPES,
+          callback: async (r) => {
+            if (r.error) { setGcLoading(false); return; }
+            window.gapi.client.setToken({ access_token: r.access_token });
+            await fetchGC();
+            setGcOn(true);
+            setGcLoading(false);
+          },
+        });
+      });
+    }, 300);
+    return () => clearInterval(iv);
+  }, []);
 
-    const evtSummary = events
-      .slice(0, 20)
-      .map((e) => `- ${e.title} (${formatTime(e.start)}–${formatTime(e.end)}, ${e.category})`)
-      .join("\n");
+  async function fetchGC() {
+    try {
+      const mon = new Date(weekDates[0]); mon.setHours(0, 0, 0, 0);
+      const sun = new Date(weekDates[4]); sun.setHours(23, 59, 59, 999);
+      const r = await window.gapi.client.calendar.events.list({
+        calendarId: "primary",
+        timeMin: mon.toISOString(),
+        timeMax: sun.toISOString(),
+        singleEvents: true,
+        orderBy: "startTime",
+        maxResults: 100,
+      });
+      setEvents(parseGCEvents(r.result.items || [], weekDates));
+    } catch(e) { console.error("fetchGC error:", e); }
+  }
 
-    const prompt = `You are an AI scheduling assistant. Here is the user's current week:
-${evtSummary || "(No events yet)"}
+  function connectGC() {
+    if (!GOOGLE_CLIENT_ID) { alert("Set VITE_GOOGLE_CLIENT_ID in Vercel Environment Variables first."); return; }
+    if (!tcRef.current)    { alert("Google API still loading — wait a moment and try again."); return; }
+    setGcLoading(true);
+    tcRef.current.requestAccessToken({ prompt: "consent" });
+  }
 
-User goal: "${command}"
+  // Ask the AI
+  async function runCmd() {
+    if (!cmd.trim()) return;
+    setLoading(true);
+    setSuggs([]);
 
-Return EXACTLY 4 scheduling suggestions as a JSON array. Each suggestion must have:
-- "action": one of "move", "create", "delete", "protect"
-- "title": event title
-- "reason": one sentence explanation (max 15 words)
-- "from": current time (if move/delete, e.g. "Mon 2pm")
-- "to": new time (if move/create, e.g. "Tue 9am")
-- "startISO": ISO datetime string for the new/created event start
-- "endISO": ISO datetime string for the new/created event end (1-2 hours after start)
+    const today  = new Date();
+    const evtStr = events.map(e =>
+      `${DAYS[e.day]||"?"} ${fmt(e.startHour)}-${fmt(e.endHour)}: ${e.title} (${e.type}, id:${e.id})`
+    ).join("\n") || "(no events this week)";
+    const tskStr = TASKS.map(t => `${t.title} [${t.priority}, ${t.estimate}]`).join("\n");
 
-Respond ONLY with a valid JSON array. No markdown, no explanation.`;
+    const exStart = new Date(weekDates[1]); exStart.setHours(9,0,0,0);
+    const exEnd   = new Date(weekDates[1]); exEnd.setHours(11,0,0,0);
+
+    const prompt = `You are a smart AI calendar assistant for a solopreneur.
+Today is ${today.toDateString()}.
+
+CALENDAR THIS WEEK:
+${evtStr}
+
+UNSCHEDULED TASKS:
+${tskStr}
+
+GOALS: Deep Work ${g.deepWork.toFixed(1)}h/10h target | Content ${g.content.toFixed(1)}h/5h target | Meetings ${g.meetings.toFixed(1)}h/8h max
+
+USER REQUEST: "${cmd}"
+
+Return ONLY a valid JSON array of exactly 3 suggestions. Each must have these exact fields:
+- "title": short calendar event name
+- "action": one sentence what to do
+- "reason": one sentence why it helps
+- "gcAction": exactly one of "create", "delete", or "none"
+- "startISO": ISO 8601 datetime this week (e.g. "${exStart.toISOString()}") — required when gcAction is "create", else ""
+- "endISO": ISO 8601 end datetime (e.g. "${exEnd.toISOString()}") — required when gcAction is "create", else ""
+- "eventId": the id from the calendar list above (e.g. "gc-abc123") when gcAction is "delete", else ""
+
+Output ONLY the JSON array. No markdown, no code fences, no explanation.`;
 
     try {
       const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": ANTHROPIC_KEY,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
         body: JSON.stringify({
           model: "claude-sonnet-4-20250514",
-          max_tokens: 1000,
-          messages: [{ role: "user", content: prompt }],
+          max_tokens: 1200,
+          messages: [{ role:"user", content:prompt }],
         }),
       });
-      const data = await res.json();
-      const text = data.content?.[0]?.text || "[]";
-      const clean = text.replace(/```json|```/g, "").trim();
-      const parsed = JSON.parse(clean);
-      setSuggestions(parsed);
-    } catch (e) {
-      setSuggestions([
-        { action: "create", title: "Deep Work Block", reason: "Schedule focused time aligned with your goal", from: "", to: "Tomorrow 9am", startISO: "", endISO: "" },
-      ]);
-    } finally {
-      setAiLoading(false);
+      const data   = await res.json();
+      const text   = (data.content?.[0]?.text || "[]").replace(/```json|```/g,"").trim();
+      const parsed = JSON.parse(text);
+      setSuggs(Array.isArray(parsed) ? parsed : []);
+    } catch(err) {
+      console.error("AI error:", err);
+      const fallStart = new Date(weekDates[0]); fallStart.setHours(9,0,0,0);
+      const fallEnd   = new Date(weekDates[0]); fallEnd.setHours(11,0,0,0);
+      setSuggs([{
+        title:"Morning Deep Work Block",
+        action:"Schedule a 2-hour focus block Monday 9-11 AM",
+        reason:"Protects your peak cognitive hours from interruptions.",
+        gcAction:"create",
+        startISO: fallStart.toISOString(),
+        endISO:   fallEnd.toISOString(),
+        eventId:""
+      }]);
     }
+    setLoading(false);
+    setCmd("");
   }
 
-  async function applySuggestion(s) {
-    if (!isSignedIn) {
-      // Demo mode: just show a message
-      setStatusMsg(`✓ Applied: "${s.title}" — ${s.reason}`);
-      setTimeout(() => setStatusMsg(""), 3000);
-      setSuggestions((prev) => prev.filter((x) => x !== s));
+  // Apply suggestion to real Google Calendar
+  async function applysugg(s, i) {
+    if (!gcOn) {
+      showToast("Connect Google Calendar first to apply changes!");
       return;
     }
     try {
-      if (s.action === "create" && s.startISO && s.endISO) {
-        await createCalendarEvent({ title: s.title, startDateTime: s.startISO, endDateTime: s.endISO });
-      } else if (s.action === "move" && s.startISO && s.endISO) {
-        const existing = events.find((e) => e.title.toLowerCase().includes(s.title.toLowerCase()));
-        if (existing?.id && existing.googleEvent) {
-          await updateCalendarEvent(existing.id, {
-            start: { dateTime: s.startISO },
-            end: { dateTime: s.endISO },
-          });
-        } else {
-          await createCalendarEvent({ title: s.title, startDateTime: s.startISO, endDateTime: s.endISO });
-        }
-      } else if (s.action === "delete") {
-        const existing = events.find((e) => e.title.toLowerCase().includes(s.title.toLowerCase()));
-        if (existing?.id && existing.googleEvent) await deleteCalendarEvent(existing.id);
+      if (s.gcAction === "create" && s.startISO && s.endISO) {
+        await window.gapi.client.calendar.events.insert({
+          calendarId: "primary",
+          resource: {
+            summary: s.title,
+            start: { dateTime: s.startISO, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone },
+            end:   { dateTime: s.endISO,   timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone },
+          },
+        });
+        await fetchGC();
+        showToast(`✓ "${s.title}" added to Google Calendar!`);
+
+      } else if (s.gcAction === "delete" && s.eventId) {
+        const realId = s.eventId.replace(/^gc-/, "");
+        await window.gapi.client.calendar.events.delete({
+          calendarId: "primary",
+          eventId: realId,
+        });
+        await fetchGC();
+        showToast(`✓ "${s.title}" removed from Google Calendar!`);
+
+      } else {
+        showToast(`✓ Noted: ${s.action}`);
       }
-      setStatusMsg(`✓ Applied: "${s.title}"`);
-      setTimeout(() => setStatusMsg(""), 3000);
-      setSuggestions((prev) => prev.filter((x) => x !== s));
-      await loadEvents();
-    } catch (e) {
-      setStatusMsg("⚠ Could not apply — check console");
-      setTimeout(() => setStatusMsg(""), 3000);
+      setSuggs(p => p.filter((_,j) => j !== i));
+    } catch(err) {
+      console.error("Apply error:", err);
+      showToast("Something went wrong — check browser console for details.");
     }
   }
 
-  async function applyAll() {
-    for (const s of suggestions) await applySuggestion(s);
+  function renderEvts(di) {
+    return events.filter(e => e.day === di).map(e => {
+      const top = ((Math.max(e.startHour - 7, 0)) / 13) * 100;
+      const h   = ((e.endHour - e.startHour) / 13) * 100;
+      const col = EC[e.type] || EC.admin;
+      return (
+        <div key={e.id} style={{
+          position:"absolute", left:3, right:3,
+          top:`${top}%`, height:`${Math.max(h,2)}%`,
+          background:col.bg, border:`1px solid ${col.border}`,
+          borderRadius:5, padding:"3px 7px",
+          fontSize:11, color:col.label,
+          overflow:"hidden", zIndex:2, boxSizing:"border-box",
+        }}>
+          <div style={{ fontWeight:600, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{e.title}</div>
+          <div style={{ fontSize:10, opacity:.7 }}>{fmt(e.startHour)} – {fmt(e.endHour)}</div>
+        </div>
+      );
+    });
   }
-
-  // Week navigation
-  const prevWeek = () => {
-    const d = new Date(weekStart);
-    d.setDate(d.getDate() - 7);
-    setWeekStart(d);
-  };
-  const nextWeek = () => {
-    const d = new Date(weekStart);
-    d.setDate(d.getDate() + 7);
-    setWeekStart(d);
-  };
-
-  // Grid rendering helpers
-  function getEventStyle(evt) {
-    const d = new Date(evt.start);
-    const dayIdx = d.getDay();
-    const top = ((hourFromDate(evt.start) - 7) / 15) * 100;
-    const height = Math.max((durationHours(evt.start, evt.end) / 15) * 100, 2);
-    const col = CATEGORY_COLORS[evt.category] || CATEGORY_COLORS.other;
-    return { dayIdx, top: `${top}%`, height: `${height}%`, ...col };
-  }
-
-  const weekDays = Array.from({ length: 7 }, (_, i) => {
-    const d = new Date(weekStart);
-    d.setDate(d.getDate() + i);
-    return d;
-  });
-
-  const isToday = (d) => {
-    const today = new Date();
-    return d.getDate() === today.getDate() && d.getMonth() === today.getMonth();
-  };
-
-  // Energy overlay data (peak hours: 9-11am, 3-5pm)
-  const energyPeaks = [{ start: 9, end: 11 }, { start: 15, end: 17 }];
 
   return (
-    <div style={{
-      minHeight: "100vh",
-      background: "linear-gradient(135deg, #0a0e1a 0%, #0d1220 50%, #0a0e1a 100%)",
-      color: "#e2e8f0",
-      fontFamily: "'DM Sans', sans-serif",
-      display: "flex",
-      flexDirection: "column",
-    }}>
+    <div style={{ fontFamily:"'DM Sans',sans-serif", background:C.bg, color:C.text, minHeight:"100vh", display:"flex", flexDirection:"column" }}>
+
+      {/* Toast notification */}
+      {toast && (
+        <div style={{
+          position:"fixed", bottom:24, left:"50%", transform:"translateX(-50%)",
+          background:"#1a3a1a", border:"1px solid #2d5a2d", color:"#4ade80",
+          padding:"10px 24px", borderRadius:10, fontSize:13, fontWeight:500,
+          zIndex:999, boxShadow:"0 4px 20px rgba(0,0,0,0.5)", whiteSpace:"nowrap",
+        }}>{toast}</div>
+      )}
+
       {/* Header */}
-      <header style={{
-        display: "flex", alignItems: "center", justifyContent: "space-between",
-        padding: "16px 28px", borderBottom: "1px solid rgba(255,255,255,0.06)",
-        background: "rgba(10,14,26,0.8)", backdropFilter: "blur(12px)",
-        position: "sticky", top: 0, zIndex: 50,
-      }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <div style={{
-            width: 36, height: 36, borderRadius: 10,
-            background: "linear-gradient(135deg, #F59E0B, #EF4444)",
-            display: "flex", alignItems: "center", justifyContent: "center",
-            fontSize: 18, fontWeight: 700,
-          }}>N</div>
-          <span style={{ fontFamily: "'DM Serif Display', serif", fontSize: 22, letterSpacing: "-0.5px" }}>
-            Nexus
-          </span>
-          <span style={{ fontSize: 11, color: "#6b7280", background: "rgba(255,255,255,0.05)", padding: "2px 8px", borderRadius: 20, marginLeft: 4 }}>
-            AI Scheduler
-          </span>
+      <header style={{ padding:"14px 24px", borderBottom:`1px solid ${C.border}`, display:"flex", alignItems:"center", justifyContent:"space-between", background:C.surface }}>
+        <div style={{ fontFamily:"'DM Serif Display',serif", fontSize:22, letterSpacing:"-0.5px" }}>
+          nexus<span style={{ color:C.amber }}>.</span>
         </div>
-
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          {/* Week nav */}
-          <button onClick={prevWeek} style={navBtn}>‹</button>
-          <span style={{ fontSize: 13, color: "#94a3b8", minWidth: 160, textAlign: "center" }}>
-            {formatDate(weekStart)} — {formatDate(weekDays[6])}
-          </span>
-          <button onClick={nextWeek} style={navBtn}>›</button>
-
-          {/* Energy toggle */}
-          <button onClick={() => setShowEnergy(!showEnergy)} style={{
-            ...navBtn, padding: "6px 12px", fontSize: 12,
-            background: showEnergy ? "rgba(245,158,11,0.15)" : "rgba(255,255,255,0.05)",
-            border: showEnergy ? "1px solid rgba(245,158,11,0.4)" : "1px solid rgba(255,255,255,0.08)",
-            color: showEnergy ? "#F59E0B" : "#94a3b8",
-          }}>⚡ Energy</button>
-
-          {/* Auth */}
-          {!googleReady ? (
-            <span style={{ fontSize: 12, color: "#6b7280" }}>Loading Google…</span>
-          ) : isSignedIn ? (
-            <button onClick={handleSignOut} style={{ ...navBtn, padding: "6px 14px", fontSize: 12, color: "#f87171" }}>
-              Sign Out
-            </button>
-          ) : (
-            <div style={{ display: "flex", gap: 8 }}>
-              <button onClick={handleSignIn} style={{
-                ...navBtn, padding: "6px 14px", fontSize: 12,
-                background: "linear-gradient(135deg, rgba(59,130,246,0.2), rgba(99,102,241,0.2))",
-                border: "1px solid rgba(99,102,241,0.4)", color: "#a5b4fc",
-              }}>
-                🗓 Connect Google Calendar
-              </button>
-              <button onClick={() => setDemoMode(true)} style={{
-                ...navBtn, padding: "6px 12px", fontSize: 12, color: "#6b7280",
-              }}>
-                Try Demo
-              </button>
-            </div>
+        <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+          <button onClick={gcOn ? undefined : connectGC} disabled={gcLoading} style={{
+            display:"flex", alignItems:"center", gap:6,
+            background: gcOn ? "#1a2a1a" : C.border,
+            border:`1px solid ${gcOn ? "#2d5a2d" : C.muted}`,
+            color: gcOn ? "#4ade80" : C.text,
+            borderRadius:8, padding:"8px 14px", fontSize:12,
+            cursor: gcOn ? "default" : "pointer",
+            fontFamily:"'DM Sans',sans-serif", fontWeight:500,
+          }}>
+            {gcLoading ? "Connecting…" : gcOn ? "✓ Google Calendar Connected" : "＋ Connect Google Calendar"}
+          </button>
+          {gcOn && (
+            <button onClick={fetchGC} title="Refresh events" style={{
+              background:C.border, border:`1px solid ${C.muted}`,
+              color:C.text, borderRadius:8, padding:"8px 12px", fontSize:14, cursor:"pointer",
+            }}>↺</button>
           )}
         </div>
       </header>
 
-      {/* Status message */}
-      {statusMsg && (
-        <div style={{
-          position: "fixed", bottom: 90, left: "50%", transform: "translateX(-50%)",
-          background: "#10b981", color: "#fff", padding: "10px 20px", borderRadius: 8,
-          fontSize: 13, fontWeight: 500, zIndex: 100, boxShadow: "0 4px 20px rgba(16,185,129,0.3)",
-        }}>{statusMsg}</div>
-      )}
+      <div style={{ display:"flex", flex:1, overflow:"hidden", height:"calc(100vh - 57px)" }}>
 
-      <div style={{ display: "flex", flex: 1, overflow: "hidden", gap: 0 }}>
         {/* Left Sidebar */}
-        <aside style={{
-          width: 220, flexShrink: 0, padding: "20px 16px",
-          borderRight: "1px solid rgba(255,255,255,0.06)",
-          overflowY: "auto", display: "flex", flexDirection: "column", gap: 20,
-        }}>
-          {/* Goals */}
-          <section>
-            <h3 style={sideHeading}>Weekly Goals</h3>
-            {goals.map((g) => {
-              const progress = getProgress(g.category);
-              const pct = Math.min((progress / g.target) * 100, 100);
-              const col = CATEGORY_COLORS[g.category];
-              return (
-                <div key={g.id} style={{ marginBottom: 14 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4, fontSize: 12 }}>
-                    <span style={{ color: "#cbd5e1" }}>{g.label}</span>
-                    <span style={{ color: col?.text || "#94a3b8" }}>{progress}/{g.target} {g.unit}</span>
-                  </div>
-                  <div style={{ height: 4, background: "rgba(255,255,255,0.07)", borderRadius: 2 }}>
-                    <div style={{ width: `${pct}%`, height: "100%", background: col?.dot || "#8B5CF6", borderRadius: 2, transition: "width 0.4s" }} />
-                  </div>
-                </div>
-              );
-            })}
-          </section>
-
-          {/* Legend */}
-          <section>
-            <h3 style={sideHeading}>Event Types</h3>
-            {Object.entries(CATEGORY_COLORS).map(([cat, col]) => (
-              <div key={cat} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, fontSize: 12 }}>
-                <div style={{ width: 10, height: 10, borderRadius: "50%", background: col.dot, flexShrink: 0 }} />
-                <span style={{ color: "#94a3b8", textTransform: "capitalize" }}>{cat.replace("-", " ")}</span>
-              </div>
-            ))}
-          </section>
-
-          {/* Unscheduled tasks */}
-          <section>
-            <h3 style={sideHeading}>Tasks (Notion)</h3>
+        <aside style={{ width:232, borderRight:`1px solid ${C.border}`, padding:"20px 14px", overflowY:"auto", display:"flex", flexDirection:"column", gap:22, background:C.surface, flexShrink:0 }}>
+          <div>
+            <div style={{ fontSize:10, letterSpacing:2, color:C.textDim, textTransform:"uppercase", marginBottom:10 }}>Weekly Goals</div>
             {[
-              { label: "Write Q2 report", priority: "P1" },
-              { label: "Record tutorial video", priority: "P2" },
-              { label: "Update pricing page", priority: "P2" },
-              { label: "Send invoices", priority: "P3" },
-            ].map((t) => (
-              <div key={t.label} style={{
-                display: "flex", justifyContent: "space-between", alignItems: "center",
-                padding: "6px 8px", borderRadius: 6, marginBottom: 4,
-                background: "rgba(255,255,255,0.03)", fontSize: 11,
-              }}>
-                <span style={{ color: "#94a3b8" }}>{t.label}</span>
-                <span style={{
-                  fontSize: 10, padding: "1px 6px", borderRadius: 4,
-                  background: t.priority === "P1" ? "rgba(239,68,68,0.15)" : t.priority === "P2" ? "rgba(245,158,11,0.15)" : "rgba(107,114,128,0.15)",
-                  color: t.priority === "P1" ? "#f87171" : t.priority === "P2" ? "#fbbf24" : "#9ca3af",
-                }}>{t.priority}</span>
+              { l:"Deep Work", v:g.deepWork, max:10, c:C.amber },
+              { l:"Content",   v:g.content,  max:5,  c:C.teal  },
+              { l:"Meetings",  v:g.meetings, max:8,  c:C.blue  },
+            ].map(x => (
+              <div key={x.l} style={{ marginBottom:12 }}>
+                <div style={{ fontSize:12, color:C.textDim, marginBottom:4, display:"flex", justifyContent:"space-between" }}>
+                  <span>{x.l}</span><span style={{ color:x.c }}>{x.v.toFixed(1)}h / {x.max}h</span>
+                </div>
+                <div style={{ height:4, background:C.border, borderRadius:2, overflow:"hidden" }}>
+                  <div style={{ width:`${Math.min((x.v/x.max)*100,100)}%`, height:"100%", background:x.c, borderRadius:2, transition:"width .4s" }} />
+                </div>
               </div>
             ))}
-          </section>
+          </div>
+
+          <div>
+            <div style={{ fontSize:10, letterSpacing:2, color:C.textDim, textTransform:"uppercase", marginBottom:10 }}>Unscheduled Tasks</div>
+            {TASKS.map(t => (
+              <div key={t.id} style={{ padding:"8px 10px", borderRadius:6, border:`1px solid ${C.border}`, marginBottom:8, fontSize:12 }}>
+                <div style={{ marginBottom:4 }}>
+                  <span style={{
+                    fontSize:10, padding:"1px 6px", borderRadius:3, fontWeight:600, marginRight:6,
+                    background: t.priority==="P1" ? C.roseDim : t.priority==="P2" ? C.amberDim : C.border,
+                    color:      t.priority==="P1" ? C.rose    : t.priority==="P2" ? C.amber    : C.muted,
+                  }}>{t.priority}</span>
+                  <span style={{ fontSize:10, color:C.textDim }}>{t.source}</span>
+                </div>
+                <div>{t.title}</div>
+                <div style={{ color:C.muted, fontSize:10, marginTop:2 }}>~{t.estimate}</div>
+              </div>
+            ))}
+          </div>
+
+          <div>
+            <div style={{ fontSize:10, letterSpacing:2, color:C.textDim, textTransform:"uppercase", marginBottom:10 }}>Legend</div>
+            {Object.entries(EC).map(([k,v]) => (
+              <div key={k} style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6, fontSize:12 }}>
+                <div style={{ width:10, height:10, borderRadius:2, background:v.border, opacity:.8 }} />
+                <span style={{ color:C.textDim }}>{v.tag}</span>
+              </div>
+            ))}
+          </div>
         </aside>
 
-        {/* Main Calendar */}
-        <main style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
-          {/* Day Headers */}
-          <div style={{
-            display: "grid", gridTemplateColumns: "52px repeat(7, 1fr)",
-            borderBottom: "1px solid rgba(255,255,255,0.06)", flexShrink: 0,
-          }}>
-            <div />
-            {weekDays.map((d, i) => (
-              <div key={i} style={{
-                padding: "10px 6px", textAlign: "center",
-                borderLeft: "1px solid rgba(255,255,255,0.04)",
-              }}>
-                <div style={{ fontSize: 11, color: "#6b7280", textTransform: "uppercase", letterSpacing: "0.05em" }}>
-                  {DAYS[d.getDay()]}
+        {/* Calendar Grid */}
+        <main style={{ flex:1, display:"flex", flexDirection:"column", overflow:"hidden" }}>
+          <div style={{ flex:1, overflowY:"auto", padding:"0 16px 16px" }}>
+            <div style={{ display:"grid", gridTemplateColumns:"48px repeat(5,1fr)" }}>
+              <div style={{ borderBottom:`1px solid ${C.border}`, height:56 }} />
+              {DAYS.map((d,i) => (
+                <div key={d} style={{ padding:"12px 8px 8px", textAlign:"center", borderBottom:`1px solid ${C.border}`, fontSize:12, color:C.textDim }}>
+                  <span style={{ fontSize:18, fontFamily:"'DM Serif Display',serif", color:C.text, display:"block" }}>{weekDates[i]?.getDate()}</span>
+                  {d}
                 </div>
-                <div style={{
-                  fontSize: 18, fontWeight: 300, marginTop: 2,
-                  color: isToday(d) ? "#F59E0B" : "#e2e8f0",
-                  ...(isToday(d) && { fontWeight: 600 }),
-                }}>{d.getDate()}</div>
-              </div>
-            ))}
-          </div>
-
-          {/* Time Grid */}
-          <div style={{ flex: 1, overflow: "auto", position: "relative" }}>
-            <div style={{
-              display: "grid", gridTemplateColumns: "52px repeat(7, 1fr)",
-              minHeight: "100%", position: "relative",
-            }}>
-              {/* Time labels */}
-              <div>
-                {HOURS.map((h) => (
-                  <div key={h} style={{ height: 56, display: "flex", alignItems: "flex-start", justifyContent: "flex-end", paddingRight: 8, paddingTop: 2 }}>
-                    <span style={{ fontSize: 10, color: "#4b5563" }}>
-                      {h === 12 ? "12pm" : h > 12 ? `${h - 12}pm` : `${h}am`}
-                    </span>
+              ))}
+              {HOURS.map(h => (
+                <div key={h} style={{ display:"contents" }}>
+                  <div style={{ fontSize:10, color:C.muted, textAlign:"right", paddingRight:8, paddingTop:2, height:52, borderBottom:`1px solid ${C.border}` }}>
+                    {h < 12 ? `${h}am` : h === 12 ? "12pm" : `${h-12}pm`}
                   </div>
-                ))}
-              </div>
-
-              {/* Day columns */}
-              {weekDays.map((day, dayIdx) => {
-                const dayEvents = events.filter((e) => {
-                  const d = new Date(e.start);
-                  return d.getDate() === day.getDate() && d.getMonth() === day.getMonth();
-                });
-
-                return (
-                  <div key={dayIdx} style={{
-                    borderLeft: "1px solid rgba(255,255,255,0.04)",
-                    position: "relative", height: `${HOURS.length * 56}px`,
-                  }}>
-                    {/* Hour lines */}
-                    {HOURS.map((h) => (
-                      <div key={h} style={{
-                        position: "absolute", left: 0, right: 0,
-                        top: `${((h - 7) / HOURS.length) * 100}%`,
-                        borderTop: "1px solid rgba(255,255,255,0.03)",
-                      }} />
-                    ))}
-
-                    {/* Energy overlay */}
-                    {showEnergy && energyPeaks.map((peak, pi) => (
-                      <div key={pi} style={{
-                        position: "absolute", left: 2, right: 2,
-                        top: `${((peak.start - 7) / HOURS.length) * 100}%`,
-                        height: `${((peak.end - peak.start) / HOURS.length) * 100}%`,
-                        background: "rgba(245,158,11,0.06)",
-                        borderLeft: "2px solid rgba(245,158,11,0.25)",
-                        borderRadius: 4, pointerEvents: "none",
-                      }} />
-                    ))}
-
-                    {/* Events */}
-                    {dayEvents.map((evt) => {
-                      const top = ((hourFromDate(evt.start) - 7) / HOURS.length) * 100;
-                      const height = Math.max((durationHours(evt.start, evt.end) / HOURS.length) * 100, 2);
-                      const col = CATEGORY_COLORS[evt.category] || CATEGORY_COLORS.other;
-                      const isSelected = selectedEvent?.id === evt.id;
-
-                      return (
-                        <div key={evt.id} onClick={() => setSelectedEvent(isSelected ? null : evt)}
-                          style={{
-                            position: "absolute", left: 3, right: 3,
-                            top: `${top}%`, height: `${height}%`,
-                            background: col.bg, borderLeft: `3px solid ${col.border}`,
-                            borderRadius: "0 5px 5px 0", padding: "3px 6px",
-                            cursor: "pointer", overflow: "hidden",
-                            boxShadow: isSelected ? `0 0 0 1px ${col.border}` : "none",
-                            transition: "box-shadow 0.15s",
-                            zIndex: isSelected ? 10 : 1,
-                          }}>
-                          <div style={{ fontSize: 11, fontWeight: 500, color: col.text, lineHeight: 1.2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                            {evt.title}
-                          </div>
-                          {height > 5 && (
-                            <div style={{ fontSize: 10, color: "rgba(255,255,255,0.35)", marginTop: 1 }}>
-                              {formatTime(evt.start)}
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-
-                    {/* Today line */}
-                    {isToday(day) && (() => {
-                      const now = new Date();
-                      const pct = ((now.getHours() + now.getMinutes() / 60 - 7) / HOURS.length) * 100;
-                      return pct > 0 && pct < 100 ? (
-                        <div style={{
-                          position: "absolute", left: 0, right: 0, top: `${pct}%`,
-                          borderTop: "2px solid #F59E0B", zIndex: 20,
-                        }}>
-                          <div style={{ width: 8, height: 8, background: "#F59E0B", borderRadius: "50%", marginTop: -5, marginLeft: -4 }} />
-                        </div>
-                      ) : null;
-                    })()}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-
-          {/* Command Bar */}
-          <div style={{
-            padding: "14px 20px", borderTop: "1px solid rgba(255,255,255,0.06)",
-            background: "rgba(10,14,26,0.9)", flexShrink: 0,
-          }}>
-            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-              <div style={{ flex: 1, position: "relative" }}>
-                <span style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)", fontSize: 14, color: "#4b5563" }}>✦</span>
-                <input
-                  value={command}
-                  onChange={(e) => setCommand(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && runAI()}
-                  placeholder='Try: "I need 10 hours of deep work this week" or "protect my mornings"'
-                  style={{
-                    width: "100%", background: "rgba(255,255,255,0.04)",
-                    border: "1px solid rgba(255,255,255,0.08)", borderRadius: 10,
-                    padding: "11px 14px 11px 34px", fontSize: 13, color: "#e2e8f0",
-                    outline: "none", boxSizing: "border-box",
-                  }}
-                />
-              </div>
-              <button onClick={runAI} disabled={aiLoading} style={{
-                padding: "11px 20px", borderRadius: 10, border: "none", cursor: "pointer",
-                background: aiLoading ? "rgba(245,158,11,0.1)" : "linear-gradient(135deg, #F59E0B, #EF4444)",
-                color: aiLoading ? "#6b7280" : "#fff", fontSize: 13, fontWeight: 600,
-                whiteSpace: "nowrap", transition: "opacity 0.2s",
-              }}>
-                {aiLoading ? "Thinking…" : "Ask AI →"}
-              </button>
-            </div>
-
-            {/* Suggestions */}
-            {suggestions.length > 0 && (
-              <div style={{ marginTop: 12 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                  <span style={{ fontSize: 12, color: "#6b7280" }}>AI Suggestions</span>
-                  <button onClick={applyAll} style={{
-                    fontSize: 11, padding: "4px 12px", borderRadius: 6, border: "1px solid rgba(245,158,11,0.3)",
-                    background: "rgba(245,158,11,0.08)", color: "#fbbf24", cursor: "pointer",
-                  }}>Apply All</button>
-                </div>
-                <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 4 }}>
-                  {suggestions.map((s, i) => (
-                    <div key={i} style={{
-                      flexShrink: 0, background: "rgba(255,255,255,0.03)",
-                      border: "1px solid rgba(255,255,255,0.07)", borderRadius: 8,
-                      padding: "10px 12px", minWidth: 200, maxWidth: 240,
-                    }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                        <span style={{
-                          fontSize: 10, padding: "2px 6px", borderRadius: 4, textTransform: "uppercase", letterSpacing: "0.05em",
-                          background: s.action === "create" ? "rgba(20,184,166,0.15)" : s.action === "move" ? "rgba(59,130,246,0.15)" : "rgba(239,68,68,0.15)",
-                          color: s.action === "create" ? "#5eead4" : s.action === "move" ? "#93c5fd" : "#f87171",
-                        }}>{s.action}</span>
-                        <button onClick={() => setSuggestions(prev => prev.filter((_, j) => j !== i))}
-                          style={{ background: "none", border: "none", color: "#4b5563", cursor: "pointer", fontSize: 14, padding: 0 }}>×</button>
-                      </div>
-                      <div style={{ fontSize: 12, fontWeight: 500, color: "#e2e8f0", marginBottom: 3 }}>{s.title}</div>
-                      <div style={{ fontSize: 11, color: "#6b7280", marginBottom: 8 }}>{s.reason}</div>
-                      {(s.from || s.to) && (
-                        <div style={{ fontSize: 10, color: "#4b5563", marginBottom: 8 }}>
-                          {s.from && <span>{s.from} → </span>}
-                          {s.to && <span style={{ color: "#94a3b8" }}>{s.to}</span>}
-                        </div>
-                      )}
-                      <button onClick={() => applySuggestion(s)} style={{
-                        width: "100%", padding: "6px", borderRadius: 6, border: "none", cursor: "pointer",
-                        background: "rgba(245,158,11,0.12)", color: "#fbbf24", fontSize: 11, fontWeight: 500,
-                      }}>Apply →</button>
+                  {DAYS.map((_,di) => (
+                    <div key={`${h}-${di}`} style={{ height:52, borderBottom:`1px solid ${C.border}`, borderLeft:`1px solid ${C.border}`, position:"relative" }}>
+                      {h === HOURS[0] && renderEvts(di)}
                     </div>
                   ))}
                 </div>
-              </div>
-            )}
+              ))}
+            </div>
+          </div>
+
+          {/* Command bar */}
+          <div style={{ borderTop:`1px solid ${C.border}`, padding:"12px 16px", background:C.surface, display:"flex", gap:10, alignItems:"center" }}>
+            <span style={{ fontSize:16, color:C.amber }}>✦</span>
+            <input
+              style={{ flex:1, background:C.bg, border:`1px solid ${C.border}`, borderRadius:8, padding:"10px 14px", color:C.text, fontSize:13, outline:"none", fontFamily:"'DM Sans',sans-serif" }}
+              placeholder='Try: "I need 10 hours of deep work" or "cancel my 9am meeting"'
+              value={cmd}
+              onChange={e => setCmd(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && runCmd()}
+            />
+            <button onClick={runCmd} disabled={loading} style={{
+              background: loading ? C.border : C.amber,
+              color: loading ? C.textDim : "#000",
+              border:"none", borderRadius:8, padding:"10px 18px",
+              fontWeight:600, fontSize:13, cursor: loading ? "default" : "pointer",
+              fontFamily:"'DM Sans',sans-serif", whiteSpace:"nowrap",
+            }}>
+              {loading ? "Thinking…" : "Ask AI →"}
+            </button>
           </div>
         </main>
 
-        {/* Right Panel — selected event */}
-        {selectedEvent && (
-          <aside style={{
-            width: 220, flexShrink: 0, padding: "20px 16px",
-            borderLeft: "1px solid rgba(255,255,255,0.06)",
-            background: "rgba(10,14,26,0.5)",
-          }}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 16 }}>
-              <h3 style={{ ...sideHeading, margin: 0 }}>Event Details</h3>
-              <button onClick={() => setSelectedEvent(null)}
-                style={{ background: "none", border: "none", color: "#6b7280", cursor: "pointer", fontSize: 16 }}>×</button>
+        {/* Right Panel: Suggestions */}
+        <aside style={{ width:268, borderLeft:`1px solid ${C.border}`, padding:"20px 14px", overflowY:"auto", background:C.surface, display:"flex", flexDirection:"column", gap:10, flexShrink:0 }}>
+          <div style={{ fontSize:10, letterSpacing:2, color:C.textDim, textTransform:"uppercase", marginBottom:4 }}>AI Suggestions</div>
+
+          {suggs.length === 0 ? (
+            <div style={{ fontSize:12, color:C.textDim, lineHeight:1.7 }}>
+              Type a goal below — Nexus will analyze your week and suggest real calendar changes.
+              <br /><br />
+              <span style={{ color:C.amber }}>Try:</span><br />
+              • "I need 10h deep work this week"<br />
+              • "Cancel my 9am meeting"<br />
+              • "Schedule my P1 tasks"<br />
+              • "Protect my mornings"
             </div>
-            <div style={{
-              padding: 12, borderRadius: 8,
-              background: CATEGORY_COLORS[selectedEvent.category]?.bg || "rgba(255,255,255,0.04)",
-              borderLeft: `3px solid ${CATEGORY_COLORS[selectedEvent.category]?.border || "#8B5CF6"}`,
-              marginBottom: 14,
-            }}>
-              <div style={{ fontSize: 13, fontWeight: 500, color: "#e2e8f0", marginBottom: 6 }}>{selectedEvent.title}</div>
-              <div style={{ fontSize: 11, color: "#94a3b8" }}>
-                {formatTime(selectedEvent.start)} — {formatTime(selectedEvent.end)}
-              </div>
-              <div style={{ fontSize: 11, color: "#6b7280", marginTop: 2, textTransform: "capitalize" }}>
-                {selectedEvent.category?.replace("-", " ")}
-              </div>
+          ) : (
+            <>
+              {suggs.map((s,i) => (
+                <div key={i} style={{ border:`1px solid ${C.amber}44`, borderRadius:8, padding:11, background:C.amberDim, fontSize:12, lineHeight:1.5 }}>
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:4 }}>
+                    <div style={{ fontWeight:600, color:C.amber, fontSize:13 }}>{s.title}</div>
+                    <span style={{
+                      fontSize:9, padding:"2px 6px", borderRadius:4, fontWeight:700, textTransform:"uppercase", letterSpacing:1,
+                      background: s.gcAction==="create" ? C.tealDim : s.gcAction==="delete" ? C.roseDim : C.border,
+                      color:      s.gcAction==="create" ? C.teal    : s.gcAction==="delete" ? C.rose    : C.muted,
+                    }}>{s.gcAction}</span>
+                  </div>
+                  <div style={{ color:C.text, marginBottom:4 }}>{s.action}</div>
+                  <div style={{ color:C.textDim, fontSize:11, marginBottom:8 }}>{s.reason}</div>
+                  {s.startISO && (
+                    <div style={{ fontSize:10, color:C.muted, marginBottom:8 }}>
+                      {new Date(s.startISO).toLocaleString("en-US",{ weekday:"short", hour:"numeric", minute:"2-digit" })}
+                      {s.endISO ? ` – ${new Date(s.endISO).toLocaleTimeString("en-US",{ hour:"numeric", minute:"2-digit" })}` : ""}
+                    </div>
+                  )}
+                  <button onClick={() => applysugg(s, i)} style={{
+                    background:C.amber, color:"#000", border:"none",
+                    borderRadius:6, padding:"6px 14px", fontWeight:600, fontSize:11,
+                    cursor:"pointer", fontFamily:"'DM Sans',sans-serif", width:"100%",
+                  }}>Apply to Calendar ✓</button>
+                </div>
+              ))}
+              {suggs.length > 1 && (
+                <button onClick={async () => { for (let i = suggs.length-1; i >= 0; i--) await applysugg(suggs[i], i); }} style={{
+                  background:"transparent", color:C.amber, border:`1px solid ${C.amber}`,
+                  padding:8, borderRadius:8, width:"100%", fontSize:12,
+                  cursor:"pointer", fontFamily:"'DM Sans',sans-serif", fontWeight:600,
+                }}>Apply All</button>
+              )}
+            </>
+          )}
+
+          <div style={{ marginTop:"auto", paddingTop:16, borderTop:`1px solid ${C.border}` }}>
+            <div style={{ fontSize:10, letterSpacing:2, color:C.textDim, textTransform:"uppercase", marginBottom:8 }}>Sync Status</div>
+            <div style={{ fontSize:11, color:C.textDim, lineHeight:1.9 }}>
+              <div>{events.filter(e => e.source==="google").length} events from Google</div>
+              <div style={{ color: gcOn ? "#4ade80" : C.muted }}>{gcOn ? "● Live — writes enabled" : "○ Not connected"}</div>
             </div>
-            {selectedEvent.description && (
-              <p style={{ fontSize: 12, color: "#6b7280", lineHeight: 1.5 }}>{selectedEvent.description}</p>
-            )}
-            <button onClick={() => {
-              if (command) setCommand(command + ` Move "${selectedEvent.title}"`);
-              else setCommand(`Reschedule "${selectedEvent.title}" to a better time`);
-              setSelectedEvent(null);
-            }} style={{
-              width: "100%", padding: "8px", borderRadius: 6, border: "1px solid rgba(245,158,11,0.2)",
-              background: "rgba(245,158,11,0.05)", color: "#fbbf24", fontSize: 12, cursor: "pointer",
-            }}>
-              Ask AI to reschedule ✦
-            </button>
-          </aside>
-        )}
+          </div>
+        </aside>
+
       </div>
     </div>
   );
 }
-
-// Shared styles
-const navBtn = {
-  background: "rgba(255,255,255,0.05)",
-  border: "1px solid rgba(255,255,255,0.08)",
-  borderRadius: 8, color: "#94a3b8",
-  cursor: "pointer", padding: "6px 10px", fontSize: 14,
-  transition: "background 0.15s",
-};
-
-const sideHeading = {
-  fontSize: 10, textTransform: "uppercase", letterSpacing: "0.1em",
-  color: "#4b5563", marginBottom: 10, marginTop: 0,
-};
